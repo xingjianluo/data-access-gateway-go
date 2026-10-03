@@ -60,11 +60,37 @@ type Rule struct {
 	Priority int
 }
 
+// RetentionAction 是保留期到期后的处置方式。
+type RetentionAction string
+
+const (
+	// RetentionDelete 到期后整条清除。
+	RetentionDelete RetentionAction = "delete"
+	// RetentionAnonymize 到期后仅匿名化指定字段，记录保留。
+	RetentionAnonymize RetentionAction = "anonymize"
+)
+
+// RetentionRule 声明某类资源到期后的处置方式。
+// 到期时刻本身由数据记录上的 RetainUntil 决定，本规则只决定"到期之后怎么处置"。
+type RetentionRule struct {
+	ID string
+	// Resources 为资源模式，支持精确匹配与前缀 * 通配（与访问规则同一口径），
+	// 因此既可按具体资源也可按资源类型（前缀）声明。
+	Resources []string
+	Action    RetentionAction
+	// Fields 仅 Action=anonymize 时生效：匿名化哪些字段由策略决定。
+	Fields []string
+	// Priority 数值越大优先级越高；多条规则命中同一资源时取优先级最高者。
+	Priority int
+}
+
 // Policy 是一个不可变的策略版本。
 type Policy struct {
 	Version int
 	Name    string
 	Rules   []Rule
+	// Retention 为保留期处置规则；为空的资源沿用调用方指定的兜底处置（兼容旧行为）。
+	Retention []RetentionRule
 }
 
 // Request 是一次访问决策请求的输入。

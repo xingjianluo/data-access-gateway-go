@@ -12,6 +12,7 @@ type Store struct {
 	mu       sync.RWMutex
 	versions map[int]*Policy
 	current  int
+	history  *History // 可选：挂载后每次发布自动写不可篡改的变更记录
 }
 
 // NewStore 创建空策略存储。
@@ -19,8 +20,18 @@ func NewStore() *Store {
 	return &Store{versions: make(map[int]*Policy)}
 }
 
+// AttachHistory 挂载变更追溯器；之后每次 Publish 成功都会把
+// "何时、从哪个版本到哪个版本、规则内容摘要" 写入哈希链审计日志。
+func (s *Store) AttachHistory(h *History) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.history = h
+}
+
 // Publish 发布一个新版本（必须单调递增），并将其置为当前版本。
 // 传入的策略会被深拷贝后保存，调用方之后修改原对象不影响已发布版本。
+// 若已挂载 History，发布事件（含切换前后版本与规则摘要）会一并写入审计链；
+// 记录失败时整体返回错误，调用方应视为发布未完成并重试。
 func (s *Store) Publish(p *Policy) error {
 	if p == nil {
 		return fmt.Errorf("policy store: cannot publish nil policy")
@@ -33,7 +44,13 @@ func (s *Store) Publish(p *Policy) error {
 	if len(s.versions) > 0 && p.Version <= s.current {
 		return fmt.Errorf("policy store: new version %d must be greater than current %d", p.Version, s.current)
 	}
-	s.versions[p.Version] = clonePolicy(p)
+	cp := clonePolicy(p)
+	if s.history != nil {
+		if _, err := s.history.RecordPublish(s.current, cp); err != nil {
+			return fmt.Errorf("policy store: record publish history: %w", err)
+		}
+	}
+	s.versions[p.Version] = cp
 	s.current = p.Version
 	return nil
 }
@@ -63,6 +80,13 @@ func (s *Store) Snapshot(version int) (*Policy, error) {
 // clonePolicy 深拷贝策略，使存储版本与调用方对象完全隔离。
 func clonePolicy(p *Policy) *Policy {
 	cp := &Policy{Version: p.Version, Name: p.Name, Rules: make([]Rule, len(p.Rules))}
+	for _, r := range p.Retention {
+		cp.Retention = append(cp.Retention, RetentionRule{
+			ID: r.ID, Action: r.Action, Priority: r.Priority,
+			Resources: append([]string(nil), r.Resources...),
+			Fields:    append([]string(nil), r.Fields...),
+		})
+	}
 	for i, r := range p.Rules {
 		nr := Rule{
 			ID: r.ID, Effect: r.Effect, Priority: r.Priority,

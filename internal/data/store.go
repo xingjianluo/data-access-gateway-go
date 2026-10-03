@@ -157,6 +157,18 @@ func (s *Store) Expired(now time.Time) []Record {
 // ReplicaCount 返回副本总数。
 func (s *Store) ReplicaCount() int { return len(s.replicas) }
 
+// ReplicaHas 报告指定副本中是否存在某资源，供上层逐副本校验处置无残留。
+func (s *Store) ReplicaHas(idx int, resource string) bool {
+	if idx < 0 || idx >= len(s.replicas) {
+		return false
+	}
+	r := s.replicas[idx]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.records[resource]
+	return ok
+}
+
 // ExportReplica 导出指定副本中匹配 subjectID 的记录（深拷贝，按资源排序），
 // 供上层交叉校验导出确实覆盖了每一个副本。
 func (s *Store) ExportReplica(idx int, subjectID string) []Record {

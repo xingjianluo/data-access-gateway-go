@@ -65,9 +65,12 @@ type Result struct {
 }
 
 // state 是某个请求 ID 的内部状态（含首次导出的数据快照，用于幂等重放）。
+// done 非 nil 表示正有一个执行者在工作；并发到达的同 ID 请求在 done 上等待，
+// 待首个执行结束后重放其结果，绝不会并发各跑一遍。
 type state struct {
 	rec     RequestRecord
 	records []ExportRecord
+	done    chan struct{} // 执行中为非 nil；执行结束（成功或失败）时关闭并置 nil
 }
 
 // Processor 处理数据主体请求：覆盖全部存储副本、保持审计不可变、
@@ -78,24 +81,45 @@ type Processor struct {
 
 	mu       sync.Mutex
 	requests map[string]*state
+	// disposed 是保留期处置台账：key 为 "资源|到期时刻"，标记已完成的处置，
+	// 防止重复扫描对同一资源重复处置、重复写审计。
+	disposed map[string]struct{}
 }
 
 // New 创建处理器。
 func New(ds *data.Store, log *audit.Log) *Processor {
-	return &Processor{store: ds, audit: log, requests: make(map[string]*state)}
+	return &Processor{store: ds, audit: log, requests: make(map[string]*state), disposed: make(map[string]struct{})}
 }
 
 // Export 执行（或幂等重放）数据主体导出请求。
 // 必须从每一个副本读取并交叉比对一致，才算覆盖全部副本；副本间不一致或
 // 未覆盖全部副本时失败并给出原因，可凭同一请求 ID 重试。
+// 并发幂等：同一请求 ID 同时提交多次时，只有一个真正执行，其余等待首个执行
+// 结束后以 Idempotent=true 重放同一份结果，不重复执行、不重复写审计。
 func (p *Processor) Export(requestID, subjectID string) (Result, error) {
-	p.mu.Lock()
-	if st, ok := p.requests[requestID]; ok && st.rec.Status == StatusCompleted {
-		p.mu.Unlock()
-		return replay(st), nil
+	for {
+		st, executor, wait, err := p.acquire(requestID, KindExport, subjectID)
+		if err != nil {
+			return Result{}, err
+		}
+		if wait != nil {
+			<-wait // 与首个执行并发到达：等它结束后重放或接力重试
+			continue
+		}
+		if !executor {
+			return p.resultOf(st, true), nil
+		}
+		res, execErr := p.doExport(st.rec.ID, st.rec.SubjectID)
+		p.finish(st, res, execErr)
+		if execErr != nil {
+			return Result{}, execErr
+		}
+		return p.resultOf(st, false), nil
 	}
-	p.mu.Unlock()
+}
 
+// doExport 是导出的实际执行体，仅由 acquire 选出的唯一执行者调用。
+func (p *Processor) doExport(requestID, subjectID string) (Result, error) {
 	n := p.store.ReplicaCount()
 	perReplica := make([][]data.Record, n)
 	for i := 0; i < n; i++ {
@@ -103,9 +127,7 @@ func (p *Processor) Export(requestID, subjectID string) (Result, error) {
 	}
 	// 交叉校验：每个副本的资源集合与数据必须完全一致。
 	if err := compareReplicas(perReplica); err != nil {
-		failed := fmt.Errorf("export request %s failed: %w; retryable", requestID, err)
-		p.recordFailure(requestID, KindExport, subjectID, n, failed.Error())
-		return Result{}, failed
+		return Result{}, fmt.Errorf("export request %s failed: %w; retryable", requestID, err)
 	}
 
 	records := make([]ExportRecord, 0, len(perReplica[0]))
@@ -120,26 +142,43 @@ func (p *Processor) Export(requestID, subjectID string) (Result, error) {
 	seq, err := p.appendAudit(requestID, "dsr.export", fmt.Sprintf("subject:%s", subjectID),
 		fmt.Sprintf("exported %d records across %d replicas", len(records), n))
 	if err != nil {
-		failed := fmt.Errorf("export request %s failed: %w; retryable", requestID, err)
-		p.recordFailure(requestID, KindExport, subjectID, n, failed.Error())
-		return Result{}, failed
+		return Result{}, fmt.Errorf("export request %s failed: %w; retryable", requestID, err)
 	}
 
-	st := p.recordSuccess(requestID, KindExport, subjectID, n, []int64{seq}, records)
-	return firstResult(st), nil
+	return Result{RequestRecord: RequestRecord{
+		ID: requestID, Kind: KindExport, SubjectID: subjectID,
+		Replicas: n, AuditSeqs: []int64{seq},
+	}, Records: records}, nil
 }
 
 // Delete 执行（或幂等重放）数据主体删除请求。
 // 仅在全部健康副本可写时才执行删除（存储层预检，不产生部分写入）；
 // 删除后再次读取每个副本校验数据主体记录已不存在。
+// 并发幂等语义与 Export 相同：同 ID 并发提交只有一个真正执行。
 func (p *Processor) Delete(requestID, subjectID string) (Result, error) {
-	p.mu.Lock()
-	if st, ok := p.requests[requestID]; ok && st.rec.Status == StatusCompleted {
-		p.mu.Unlock()
-		return replay(st), nil
+	for {
+		st, executor, wait, err := p.acquire(requestID, KindDelete, subjectID)
+		if err != nil {
+			return Result{}, err
+		}
+		if wait != nil {
+			<-wait
+			continue
+		}
+		if !executor {
+			return p.resultOf(st, true), nil
+		}
+		res, execErr := p.doDelete(st.rec.ID, st.rec.SubjectID)
+		p.finish(st, res, execErr)
+		if execErr != nil {
+			return Result{}, execErr
+		}
+		return p.resultOf(st, false), nil
 	}
-	p.mu.Unlock()
+}
 
+// doDelete 是删除的实际执行体，仅由 acquire 选出的唯一执行者调用。
+func (p *Processor) doDelete(requestID, subjectID string) (Result, error) {
 	n := p.store.ReplicaCount()
 	targets := p.store.FindBySubject(subjectID)
 
@@ -147,16 +186,12 @@ func (p *Processor) Delete(requestID, subjectID string) (Result, error) {
 	for _, rec := range targets {
 		existed, err := p.store.Delete(rec.Resource)
 		if err != nil {
-			failed := fmt.Errorf("delete request %s failed at resource %s: %w; retryable", requestID, rec.Resource, err)
-			p.recordFailure(requestID, KindDelete, subjectID, n, failed.Error())
-			return Result{}, failed
+			return Result{}, fmt.Errorf("delete request %s failed at resource %s: %w; retryable", requestID, rec.Resource, err)
 		}
 		seq, aerr := p.appendAudit(requestID, "dsr.delete", rec.Resource,
 			fmt.Sprintf("deleted for subject %s (existed=%t) across %d replicas", subjectID, existed, n))
 		if aerr != nil {
-			failed := fmt.Errorf("delete request %s failed: %w; retryable", requestID, aerr)
-			p.recordFailure(requestID, KindDelete, subjectID, n, failed.Error())
-			return Result{}, failed
+			return Result{}, fmt.Errorf("delete request %s failed: %w; retryable", requestID, aerr)
 		}
 		seqs = append(seqs, seq)
 	}
@@ -165,14 +200,14 @@ func (p *Processor) Delete(requestID, subjectID string) (Result, error) {
 	for i := 0; i < n; i++ {
 		if left := p.store.ExportReplica(i, subjectID); len(left) != 0 {
 			err := fmt.Errorf("replica %d still contains %d records of subject %s", i, len(left), subjectID)
-			failed := fmt.Errorf("delete request %s failed: %w; retryable", requestID, err)
-			p.recordFailure(requestID, KindDelete, subjectID, n, failed.Error())
-			return Result{}, failed
+			return Result{}, fmt.Errorf("delete request %s failed: %w; retryable", requestID, err)
 		}
 	}
 
-	st := p.recordSuccess(requestID, KindDelete, subjectID, n, seqs, nil)
-	return firstResult(st), nil
+	return Result{RequestRecord: RequestRecord{
+		ID: requestID, Kind: KindDelete, SubjectID: subjectID,
+		Replicas: n, AuditSeqs: seqs,
+	}}, nil
 }
 
 // RetentionSweep 对 now 时刻已过保留期的数据执行处置：
@@ -263,39 +298,65 @@ func (p *Processor) appendAudit(requestID, action, resource, reason string) (int
 	return e.Seq, nil
 }
 
-func (p *Processor) recordFailure(requestID string, kind Kind, subjectID string, replicas int, msg string) {
+// acquire 按请求 ID 仲裁执行权（single-flight）：
+//   - 首次到达：登记状态并成为执行者（executor=true）；
+//   - 已有执行在进行中：返回 wait 通道，调用方等待后重新仲裁；
+//   - 已完成：executor=false，调用方直接重放结果；
+//   - 已失败且无执行进行中：调用方成为新的执行者（凭同一 ID 重试）。
+//
+// 同一 ID 若以不同的类型或数据主体提交，属于调用错误，显式拒绝。
+func (p *Processor) acquire(requestID string, kind Kind, subjectID string) (st *state, executor bool, wait chan struct{}, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.requests[requestID] = &state{rec: RequestRecord{
-		ID: requestID, Kind: kind, SubjectID: subjectID,
-		Status: StatusFailed, Error: msg, Replicas: replicas, CreatedAt: time.Now().UTC(),
-	}}
-}
-
-func (p *Processor) recordSuccess(requestID string, kind Kind, subjectID string, replicas int, seqs []int64, records []ExportRecord) *state {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	st := &state{
-		rec: RequestRecord{
-			ID: requestID, Kind: kind, SubjectID: subjectID,
-			Status: StatusCompleted, Replicas: replicas, AuditSeqs: append([]int64(nil), seqs...),
-			CreatedAt: time.Now().UTC(),
-		},
-		records: records,
+	st, ok := p.requests[requestID]
+	if !ok {
+		st = &state{rec: RequestRecord{
+			ID: requestID, Kind: kind, SubjectID: subjectID, CreatedAt: time.Now().UTC(),
+		}}
+		st.done = make(chan struct{})
+		p.requests[requestID] = st
+		return st, true, nil, nil
 	}
-	p.requests[requestID] = st
-	return st
+	if st.rec.Kind != kind || st.rec.SubjectID != subjectID {
+		return nil, false, nil, fmt.Errorf("dsr: request id %s already used for %s of subject %s; cannot reuse for %s of subject %s",
+			requestID, st.rec.Kind, st.rec.SubjectID, kind, subjectID)
+	}
+	if st.done != nil {
+		return nil, false, st.done, nil
+	}
+	if st.rec.Status == StatusCompleted {
+		return st, false, nil, nil
+	}
+	// 此前失败：本次调用作为重试接管执行权。
+	st.done = make(chan struct{})
+	return st, true, nil, nil
 }
 
-func replay(st *state) Result {
-	r := firstResult(st)
-	r.Idempotent = true
-	return r
+// finish 由执行者在执行结束后调用：把最终结果写入共享状态并唤醒所有等待者。
+// 成功与失败都只有一种终态记录；失败后可被后续 acquire 接管重试。
+func (p *Processor) finish(st *state, res Result, execErr error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if execErr != nil {
+		st.rec.Status = StatusFailed
+		st.rec.Error = execErr.Error()
+	} else {
+		st.rec.Status = StatusCompleted
+		st.rec.Error = ""
+		st.rec.Replicas = res.Replicas
+		st.rec.AuditSeqs = append([]int64(nil), res.AuditSeqs...)
+		st.records = res.Records
+	}
+	close(st.done)
+	st.done = nil
 }
 
-func firstResult(st *state) Result {
+// resultOf 在锁内拷贝当前状态为结果快照；idempotent 标记是否为重放。
+func (p *Processor) resultOf(st *state, idempotent bool) Result {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return Result{
-		Idempotent:    false,
+		Idempotent:    idempotent,
 		RequestRecord: st.rec,
 		Records:       st.records,
 	}
