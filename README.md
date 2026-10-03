@@ -4,19 +4,21 @@
 
 - 基于 **主体 / 资源 / 动作 / 环境属性** 的访问决策：放行、拒绝、字段级脱敏，各有稳定可区分的判定原因；
 - **策略热更新**与高并发访问：单个请求在其生命周期内固定使用同一版本策略；
+- **策略变更追溯**：每次发布/切换（何时、从哪版到哪版、规则摘要）写入哈希链审计，不可篡改、可按版本/按访问请求回溯；
 - **哈希链审计日志**：追加不可变，支持完整性校验，高并发下不丢失 / 不重复 / 不错配；
-- **数据保留期与数据主体请求（DSR）**：到期清除或匿名化；导出 / 删除覆盖全部存储副本；失败可重试、重复请求幂等且显式可识别。
+- **策略化保留期处置**：到期后"整条清除还是匿名化哪些字段"由策略按资源/资源类型声明，同次扫描不同资源各走各的处置；
+- **数据主体请求（DSR）**：导出 / 删除覆盖全部存储副本；失败可重试；并发下同标识请求 single-flight，只有一个真正执行，其余显式重放。
 
 ## 目录结构
 
 ```
 internal/
-  policy/   策略模型、版本化快照存储、判定引擎（deny 优先）
+  policy/   策略模型、版本化快照存储、判定引擎（deny 优先）、保留期规则解析、发布追溯
   data/     内存多副本存储（写入预检、保留期元数据、故障注入）
   mask/     字段脱敏（redact / partial / hash）
   audit/    追加式哈希链审计日志（SHA-256）
   gateway/  编排：取快照 -> 判定 -> 取数/脱敏 -> 写审计
-  dsr/      数据主体导出/删除、幂等状态、保留期扫描
+  dsr/      数据主体导出/删除、single-flight 幂等状态、策略化保留期扫描
 cmd/demo/   端到端可运行演示
 ```
 
@@ -77,13 +79,44 @@ Rule{
 - 网关测试 `TestAccess_HotReloadRace_PinsOneVersionPerRequest` 在后台持续发布新版本（奇偶版本 allow/deny）
   的同时发起 300 个并发请求，并在 `-race` 下校验：返回决策、审计版本、数据有无严格一致，无错配。
 
-## 保留规则
+## 策略变更追溯
+
+- `policy.NewHistory(auditLog)` + `Store.AttachHistory(hist)` 后，每次 `Publish` 都会把一条
+  **发布记录**（`policy.PublishRecord`：发布时间、从哪版到哪版、策略名、规则 ID 列表、规则内容 SHA-256 摘要、
+  保留期规则数）作为普通条目追加到哈希链审计日志（`Action=policy.publish`，`RequestID=policy-publish:<版本>`）。
+- 因为发布记录就在哈希链上，**现有 `Log.Verify()` 自动将其纳入完整性校验**：事后篡改发布记录同样会在对应 seq 检出。
+- 回溯方式：
+  - `hist.Lookup(version)`：查某版本是什么时候、从哪个版本、以什么规则内容装入的；
+  - `hist.TraceByRequest(requestID)`：由一次访问的审计记录（含 `policy_version`）顺藤摸瓜定位该版本的发布记录。
+- 发布记录写入失败时 `Publish` 整体报错，不会出现"策略上线了但无追溯记录"。
+
+## 保留期策略模型
 
 - 记录带 `RetainUntil *time.Time`；`nil` 表示长期保留。
-- 到期判定为严格 `RetainUntil.Before(now)`：到期时刻本身尚未到期，晚 1 纳秒才到期（边界在测试中固定）。
-- `Processor.RetentionSweep(now, action, fields)`：
-  - `delete`：从全部健康副本删除，逐条写不可变审计；
-  - `anonymize`：将指定字段替换为 `<anonymized>` 并清除保留期标记（避免重复处置）。
+- 到期判定为严格 `RetainUntil.Before(now)`：到期时刻本身尚未到期，晚 1 纳秒才到期（边界在测试中固定，
+  新旧两种扫描口径一致）。
+- **处置方式收进策略**：策略版本可携带 `Retention []RetentionRule`：
+
+  ```go
+  RetentionRule{
+    ID:        "anon-users",
+    Resources: []string{"users/*"},            // 与访问规则同一口径：精确或前缀 * 通配
+    Action:    "delete" | "anonymize",
+    Fields:    []string{"email", "ssn"},       // 仅 anonymize：匿名化哪些字段由策略决定
+    Priority:  20,                             // 多规则命中时按优先级降序、ID 升序稳定裁决
+  }
+  ```
+
+- `Processor.SweepWithPolicy(now, snap, fallbackAction, fallbackFields)`：
+  - 每条到期资源独立用 `Policy.RetentionFor(resource)` 解析处置方式——**同一次扫描里不同资源
+    可以一个整条清除、另一个只匿名化指定字段，互不影响**；
+  - 每条处置写一条不可变审计，记录所用策略版本与命中规则（或 `via fallback`）；
+  - 任一资源处置失败立即返回错误（明确 `retryable`），**绝不"报成功但没处置完"**；
+    存储层全副本预检保证不产生部分写入，副本恢复后重跑会把残留清干净；
+  - 已处置的资源由**处置台账**（资源+到期时刻）标记，且匿名化后清除保留期标记：
+    再次扫描不重复处置、不重复写审计。
+- **兼容范围**：未配置保留期策略的资源沿用旧行为——由调用方通过 `fallbackAction/fallbackFields`
+  指定处置；旧的 `RetentionSweep(now, action, fields)` 接口原样保留。
 
 ## 数据主体请求（导出 / 删除）
 
@@ -91,8 +124,10 @@ Rule{
   存在不健康副本时返回 `data.ReplicaError`（点名失败副本，明确可重试），不产生部分写入，绝不静默成功。
 - **导出**：从每个副本分别读取，交叉比对资源集合与字段指纹完全一致才算覆盖全部副本；不一致即失败可重试。
 - **删除**：逐资源删除全部副本，随后再次逐副本校验该主体记录已不存在。
-- **幂等**：以请求 ID 记录状态。`completed` 的重复请求返回首次结果且 `Idempotent=true`（显式可识别，而非静默成功），
-  且不重复写审计；`failed` 的请求允许用同一 ID 重试。
+- **并发幂等（single-flight）**：以请求 ID 仲裁执行权——同一 ID 被同时提交多次时，只有一个真正执行，
+  其余在首个执行结束后以 `Idempotent=true` 重放**同一份结果**（显式可识别，而非静默成功），不重复执行、不重复写审计。
+- **失败重试**：`failed` 状态允许凭同一 ID 重试；重试成功后审计中只有一份最终结果，不会出现重复的成功记录。
+- 同一 ID 被用于不同类型或不同数据主体的请求时显式报错，防止标识串用。
 
 ## 审计完整性校验
 
@@ -116,9 +151,20 @@ go test ./... -race -v
 # 仅跑竞态热更新测试
 go test ./internal/gateway/ -race -run HotReload -v
 
-# 端到端演示：放行/拒绝/脱敏、热更新、导出/删除、保留期、审计篡改检出
+# 保留期策略化处置（按资源区分处置 / 副本故障恢复收敛 / 到期边界）
+go test ./internal/dsr/ -race -run SweepWithPolicy -v
+
+# 策略变更追溯（发布记录入链、篡改检出、按请求回溯）
+go test ./internal/policy/ -run PublishHistory -v
+
+# DSR 并发幂等（同标识并发提交、失败后并发重试）
+go test ./internal/dsr/ -race -run "Concurrent|RequestIDConflict" -v
+
+# 端到端演示：放行/拒绝/脱敏、热更新、变更追溯、导出/删除、策略化保留期、审计篡改检出
 go run ./cmd/demo
 ```
 
-单测日志会打印每个用例的**输入**、每条**命中的规则及命中/未命中依据**、最终**判定与原因**，
-DSR 用例打印副本覆盖、幂等标记与重试结果，审计用例打印哈希链与篡改检出位置。
+单测日志会打印每个用例的**输入**、每条**命中的规则及命中/未命中依据**、最终**判定与原因**；
+保留期用例打印每条资源的处置方式与依据（命中规则或兜底）、副本故障/恢复后的收敛过程；
+变更追溯用例打印发布记录内容与篡改检出位置；DSR 并发用例打印每个 goroutine 的
+`Idempotent` 标记、真正执行次数与最终审计条数。
