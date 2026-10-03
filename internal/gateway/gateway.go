@@ -99,6 +99,36 @@ func (g *Gateway) Access(in AccessInput) (AccessOutput, error) {
 	return AccessOutput{}, fmt.Errorf("gateway: unknown decision %q", dr.Decision)
 }
 
+// PolicyTrace 是一次访问判定所用策略版本的溯源信息：
+// 除了版本号，还能看到该版本是什么时候、从哪个版本切换过来的、规则摘要是什么。
+type PolicyTrace struct {
+	RequestID   string
+	AuditSeq    int64
+	PolicyVer   int
+	Decision    string
+	Reason      string
+	Change      policy.ChangeRecord // 该版本装进来时留下的变更记录
+	ChangeFound bool                // false 表示该版本无变更记录（如外挂策略）
+}
+
+// TracePolicy 按请求 ID 溯源：先定位该次访问的审计条目取得策略版本，
+// 再顺藤摸瓜找到这个版本是何时、如何被发布切换进来的。
+func (g *Gateway) TracePolicy(requestID string) (PolicyTrace, error) {
+	e, ok := g.audit.EntryByRequest(requestID)
+	if !ok {
+		return PolicyTrace{}, fmt.Errorf("gateway: no audit entry for request %q", requestID)
+	}
+	tr := PolicyTrace{
+		RequestID: requestID,
+		AuditSeq:  e.Seq,
+		PolicyVer: e.PolicyVer,
+		Decision:  e.Decision,
+		Reason:    e.Reason,
+	}
+	tr.Change, tr.ChangeFound = g.policies.ChangeForVersion(e.PolicyVer)
+	return tr, nil
+}
+
 // maskedFields 返回记录中实际存在、因而真正被脱敏的字段。
 func maskedFields(rec map[string]any, rules []policy.MaskRule) []string {
 	var fs []string

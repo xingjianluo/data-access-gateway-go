@@ -17,6 +17,7 @@ func main() {
 	ps := policy.NewStore()
 	ds := data.NewStore(3)
 	lg := audit.NewLog()
+	ps.AttachAudit(lg) // 策略发布/切换也写入同一条不可篡改审计链
 	gw := gateway.New(ps, ds, lg)
 	proc := dsr.New(ds, lg)
 
@@ -62,15 +63,32 @@ func main() {
 	access("req-2", "user:1002", "finance") // deny 优先
 	access("req-3", "stranger:9", "")       // 默认拒绝
 
-	fmt.Println("== 策略热更新（v2：放行明文）==")
+	fmt.Println("== 策略热更新（v2：放行明文 + 保留期处置规则）==")
 	ps.Publish(&policy.Policy{Version: 2, Name: "open", Rules: []policy.Rule{
 		{ID: "open-read", Effect: policy.EffectAllow,
 			Actions: []policy.Action{policy.ActionRead}, Subjects: []string{"user:*"}, Resources: []string{"users/*"}},
+	}, Retention: []policy.RetentionRule{
+		// 处置方式收敛在策略里：users/1 到期整条删除，其余 users/* 到期匿名化 email/ssn
+		{ID: "rt-users1-delete", Resources: []string{"users/1"}, Action: policy.RetentionDelete, Priority: 20},
+		{ID: "rt-users-anon", Resources: []string{"users/*"}, Action: policy.RetentionAnonymize,
+			AnonymizeFields: []string{"email", "ssn"}, Priority: 10},
 	}})
 	access("req-4", "user:1001", "eng")
 	fmt.Printf("req-1 仍可追溯到其生命周期内的版本与判定:\n")
 	if e, ok := lg.EntryByRequest("req-1"); ok {
 		fmt.Printf("  audit seq=%d ver=%d decision=%s reason=%q\n", e.Seq, e.PolicyVer, e.Decision, e.Reason)
+	}
+
+	fmt.Println("== 策略版本溯源（由访问结论追到版本安装记录）==")
+	for _, id := range []string{"req-1", "req-4"} {
+		tr, err := gw.TracePolicy(id)
+		if err != nil {
+			fmt.Printf("  %s: %v\n", id, err)
+			continue
+		}
+		fmt.Printf("  %s: decision=%s policyVer=%d <- change v%d->v%d at %s\n    summary=%s\n",
+			id, tr.Decision, tr.PolicyVer, tr.Change.FromVersion, tr.Change.ToVersion,
+			tr.Change.Time.Format("15:04:05.000"), tr.Change.Summary)
 	}
 
 	fmt.Println("== 数据主体导出/删除（覆盖 3 副本）==")
@@ -82,13 +100,27 @@ func main() {
 	del, err := proc.Delete("dsr-del-1", "subj-1")
 	fmt.Printf("delete err=%v replicas=%d seqs=%v\n", err, del.Replicas, del.AuditSeqs)
 
-	fmt.Println("== 保留期清理 ==")
+	fmt.Println("== 保留期清理（策略驱动：处置方式由策略决定）==")
 	now := time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC)
-	affected, err := proc.RetentionSweep(now, dsr.SweepAnonymize, []string{"email", "ssn"})
-	fmt.Printf("sweep affected=%v err=%v\n", affected, err)
-	if r, ok := ds.Get("users/1"); ok {
-		fmt.Printf("users/1 after anonymize=%v retainUntil=%v\n", r.Data, r.RetainUntil)
+	snap, _ := ps.Snapshot(0) // 当前版本含保留期规则：users/* 匿名化 email/ssn
+	affected, err := proc.RetentionSweepByPolicy(now, snap, dsr.SweepDelete, nil)
+	fmt.Printf("sweep affected=%v err=%v (users/2 按策略匿名化，未配规则的资源走兜底删除)\n", affected, err)
+	if r, ok := ds.Get("users/2"); ok {
+		fmt.Printf("users/2 after policy anonymize=%v retainUntil=%v\n", r.Data, r.RetainUntil)
 	}
+
+	fmt.Println("== 保留期扫描：副本故障 -> 恢复后重跑收敛 ==")
+	ds.Put(data.Record{ID: "users/5", SubjectID: "subj-5", Resource: "users/5",
+		Data: map[string]any{"name": "eve", "email": "eve@example.com"}, RetainUntil: &past})
+	ds.SetReplicaHealthy(2, false)
+	if _, err := proc.RetentionSweepByPolicy(now, snap, dsr.SweepDelete, nil); err != nil {
+		fmt.Printf("replica 2 down -> sweep 显式失败（绝不报成功）: %v\n", err)
+	}
+	ds.SetReplicaHealthy(2, true)
+	affected, err = proc.RetentionSweepByPolicy(now, snap, dsr.SweepDelete, nil)
+	fmt.Printf("恢复后重跑: affected=%v err=%v（残留已收敛）\n", affected, err)
+	again, _ := proc.RetentionSweepByPolicy(now, snap, dsr.SweepDelete, nil)
+	fmt.Printf("第三次扫描: affected=%v（已处置资源不重复处置、不重复写审计）\n", again)
 
 	fmt.Println("== 审计完整性 ==")
 	fmt.Printf("entries=%d\n", lg.Len())

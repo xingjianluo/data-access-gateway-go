@@ -154,6 +154,21 @@ func (s *Store) Expired(now time.Time) []Record {
 	return out
 }
 
+// GetReplica 从指定副本读取记录（深拷贝），供上层逐副本核验处置是否真正收敛。
+func (s *Store) GetReplica(idx int, resource string) (Record, bool) {
+	if idx < 0 || idx >= len(s.replicas) {
+		return Record{}, false
+	}
+	r := s.replicas[idx]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.records[resource]
+	if !ok {
+		return Record{}, false
+	}
+	return cloneRecordPtr(rec), true
+}
+
 // ReplicaCount 返回副本总数。
 func (s *Store) ReplicaCount() int { return len(s.replicas) }
 
