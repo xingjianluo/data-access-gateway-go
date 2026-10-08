@@ -118,6 +118,32 @@ func main() {
 	again, _ := proc.SweepWithPolicy(now, snap, dsr.SweepDelete, nil)
 	fmt.Printf("二次扫描 affected=%v（已处置资源不重复处置、不重复写审计）\n", again)
 
+	fmt.Println("== 单轮扫描资源间互不影响（一个资源故障，其余照常处置；恢复后重跑收敛）==")
+	// 三条更晚到期的资源，故障只注入到 logs/blk 的删除操作上。
+	past2 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	now2 := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	ds.Put(data.Record{ID: "users/7", SubjectID: "subj-7", Resource: "users/7",
+		Data:        map[string]any{"name": "carol", "email": "carol@example.com"},
+		RetainUntil: &past2})
+	ds.Put(data.Record{ID: "logs/blk", SubjectID: "subj-8", Resource: "logs/blk",
+		Data:        map[string]any{"line": "blocked"},
+		RetainUntil: &past2})
+	ds.Put(data.Record{ID: "orders/7", SubjectID: "subj-9", Resource: "orders/7",
+		Data:        map[string]any{"total": 7},
+		RetainUntil: &past2})
+	ds.SetResourceFault("delete", "logs/blk", true)
+	affected, err = proc.SweepWithPolicy(now2, snap, dsr.SweepDelete, nil)
+	fmt.Printf("故障轮: affected=%v（users/7 匿名化、orders/7 兜底清除照常完成）\n", affected)
+	fmt.Printf("故障轮: err=%v（本轮没做完，明确可重跑；logs/blk 未留成功审计）\n", err)
+	if _, ok := ds.Get("logs/blk"); ok {
+		fmt.Println("logs/blk 故障未处置，其余资源未被拖累")
+	}
+	ds.SetResourceFault("delete", "logs/blk", false)
+	affected, err = proc.SweepWithPolicy(now2, snap, dsr.SweepDelete, nil)
+	fmt.Printf("恢复后重跑: affected=%v err=%v（只剩 logs/blk，补齐后收敛）\n", affected, err)
+	again, _ = proc.SweepWithPolicy(now2, snap, dsr.SweepDelete, nil)
+	fmt.Printf("收敛后再扫: affected=%v（每种处置恰一条审计，不重复）\n", again)
+
 	fmt.Println("== 审计完整性 ==")
 	fmt.Printf("entries=%d\n", lg.Len())
 	if seq, err := lg.Verify(); seq == -1 {

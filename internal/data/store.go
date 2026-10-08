@@ -39,6 +39,11 @@ type replica struct {
 // 否则返回 *ReplicaError（可重试），绝不静默成功。
 type Store struct {
 	replicas []*replica
+
+	// faultMu/faults 仅用于测试：按 (op, resource) 注入单资源故障，
+	// 模拟同一轮扫描里只有某个资源的存储副本不可用、其余资源正常。
+	faultMu sync.Mutex
+	faults  map[string]map[string]bool
 }
 
 // NewStore 创建具有 n 个副本的存储（n>=1）。
@@ -46,7 +51,7 @@ func NewStore(n int) *Store {
 	if n < 1 {
 		n = 1
 	}
-	s := &Store{}
+	s := &Store{faults: make(map[string]map[string]bool)}
 	for i := 0; i < n; i++ {
 		s.replicas = append(s.replicas, &replica{records: make(map[string]*Record), healthy: true})
 	}
@@ -82,6 +87,9 @@ func (s *Store) Get(resource string) (Record, bool) {
 
 // Delete 删除全部健康副本中的记录；返回副本 0 中删除前是否存在。
 func (s *Store) Delete(resource string) (bool, error) {
+	if err := s.resourceFault("delete", resource); err != nil {
+		return false, err
+	}
 	if err := s.preflight("delete"); err != nil {
 		return false, err
 	}
@@ -102,6 +110,9 @@ func (s *Store) Delete(resource string) (bool, error) {
 // Anonymize 将全部健康副本中指定字段替换为匿名值 "<anonymized>"。
 // 返回副本 0 中记录是否存在。
 func (s *Store) Anonymize(resource string, fields []string) (bool, error) {
+	if err := s.resourceFault("anonymize", resource); err != nil {
+		return false, err
+	}
 	if err := s.preflight("anonymize"); err != nil {
 		return false, err
 	}
@@ -197,6 +208,47 @@ func (s *Store) SetReplicaHealthy(idx int, healthy bool) {
 	r.mu.Lock()
 	r.healthy = healthy
 	r.mu.Unlock()
+}
+
+// SetResourceFault 仅用于测试：对指定资源注入/解除指定操作（delete/anonymize）
+// 的单资源故障。故障在变更预检之前返回，不产生任何部分写入，调用方可安全重试。
+// 与整副本故障不同，它只影响命中的 (op, resource)，同轮扫描里其他资源照常处置。
+func (s *Store) SetResourceFault(op, resource string, enabled bool) {
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	if !enabled {
+		if byRes, ok := s.faults[op]; ok {
+			delete(byRes, resource)
+		}
+		return
+	}
+	byRes := s.faults[op]
+	if byRes == nil {
+		byRes = make(map[string]bool)
+		s.faults[op] = byRes
+	}
+	byRes[resource] = true
+}
+
+// resourceFault 返回单资源注入故障；在任何变更之前调用，不产生部分写入。
+func (s *Store) resourceFault(op, resource string) error {
+	s.faultMu.Lock()
+	failed := s.faults[op][resource]
+	s.faultMu.Unlock()
+	if !failed {
+		return nil
+	}
+	return &ResourceError{Op: op, Resource: resource}
+}
+
+// ResourceError 表示某个资源上的操作因故障失败（测试故障注入），操作可安全重试。
+type ResourceError struct {
+	Op       string
+	Resource string
+}
+
+func (e *ResourceError) Error() string {
+	return fmt.Sprintf("data store: op=%s failed for resource %s; operation is retryable", e.Op, e.Resource)
 }
 
 // preflight 检查全部副本健康；不健康则返回失败副本列表，不执行任何变更。

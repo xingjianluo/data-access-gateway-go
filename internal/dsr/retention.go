@@ -3,6 +3,7 @@ package dsr
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/xingjianluo/data-access-gateway-go/internal/audit"
@@ -14,10 +15,16 @@ import (
 //   - 资源命中策略中的保留期规则时，按规则声明的方式处置（整条清除 / 匿名化指定字段）；
 //   - 未命中任何规则的资源沿用 fallbackAction/fallbackFields（兼容未配置策略的旧行为）。
 //
-// 同一次扫描里不同资源可以走不同处置，互不影响；每条处置写一条不可变审计，
-// 审计中记录本次使用的策略版本。任一资源处置失败立即返回错误（可重试），
-// 绝不"报成功但没处置完"；已处置过的资源由处置台账标记，再次扫描不会重复处置、
-// 不会重复写审计。到期边界与 RetentionSweep 一致：严格 RetainUntil < now。
+// 单轮扫描内各资源的处置互不影响：某个资源处置失败（命中的规则内容有误、
+// 其存储副本暂不可用、审计写入失败等）只记录该资源的失败原因并继续处置其余资源，
+// 绝不中断同轮其他资源。成功处置的资源返回在 affected 中（按名称排序）并各写一条
+// 不可变审计（记录本次使用的策略版本）。
+//
+// 只要本轮有资源未处置完，就返回 *SweepIncompleteError（错误文案明确可重试），
+// 绝不"报成功但没处置完"；调用方重跑同一轮扫描即可：已成功的资源由处置台账
+// （资源+到期时刻）跳过，不再重复处置、不再重复写审计；此前失败的资源恢复后
+// （副本回来、规则修好）在重跑中补齐，直到全部到期资源收敛。
+// 到期边界与 RetentionSweep 一致：严格 RetainUntil < now。
 func (p *Processor) SweepWithPolicy(now time.Time, snap *policy.Policy, fallbackAction SweepAction, fallbackFields []string) ([]string, error) {
 	version := 0
 	if snap != nil {
@@ -25,6 +32,7 @@ func (p *Processor) SweepWithPolicy(now time.Time, snap *policy.Policy, fallback
 	}
 	expired := p.store.Expired(now)
 	affected := make([]string, 0, len(expired))
+	var failures []*ResourceFailure
 	for _, rec := range expired {
 		if rec.RetainUntil == nil {
 			continue
@@ -44,7 +52,12 @@ func (p *Processor) SweepWithPolicy(now time.Time, snap *policy.Policy, fallback
 			case policy.RetentionAnonymize:
 				action, fields = SweepAnonymize, rule.Fields
 			default:
-				return affected, fmt.Errorf("retention sweep: resource %s: policy rule %s has unknown action %q", rec.Resource, rule.ID, rule.Action)
+				// 规则内容问题只影响命中该规则的资源，不拖累同轮其他资源。
+				failures = append(failures, &ResourceFailure{
+					Resource: rec.Resource,
+					Err:      fmt.Errorf("policy rule %s has unknown action %q; retryable after rule fixed", rule.ID, rule.Action),
+				})
+				continue
 			}
 			source = fmt.Sprintf("policy rule %s (v%d)", rule.ID, version)
 		}
@@ -56,16 +69,49 @@ func (p *Processor) SweepWithPolicy(now time.Time, snap *policy.Policy, fallback
 		case SweepAnonymize:
 			err = p.sweepAnonymize(rec, now, fields, version, source)
 		default:
-			err = fmt.Errorf("unknown sweep action %q", action)
+			err = fmt.Errorf("unknown sweep action %q; retryable after caller configuration fixed", action)
 		}
 		if err != nil {
-			return affected, fmt.Errorf("retention sweep: resource %s: %w; retryable", rec.Resource, err)
+			// 单资源失败不中断扫描：记录原因（可重试），其余到期资源照常处置。
+			failures = append(failures, &ResourceFailure{Resource: rec.Resource, Err: err})
+			continue
 		}
 		p.markDisposed(marker)
 		affected = append(affected, rec.Resource)
 	}
 	sort.Strings(affected)
+	if len(failures) > 0 {
+		return affected, &SweepIncompleteError{Failed: failures}
+	}
 	return affected, nil
+}
+
+// ResourceFailure 记录单轮扫描中某个资源处置失败的原因；该资源未进入处置台账，
+// 下轮重跑会重试，且不会为其写成功处置审计。
+type ResourceFailure struct {
+	Resource string
+	Err      error
+}
+
+func (f *ResourceFailure) Error() string {
+	return fmt.Sprintf("resource %s: %v", f.Resource, f.Err)
+}
+
+// SweepIncompleteError 表示一轮扫描未全部完成：本轮有资源处置失败，
+// 调用方应修复故障后重跑同一轮扫描以收敛。错误按资源名稳定排序，可程序判断。
+type SweepIncompleteError struct {
+	Failed []*ResourceFailure
+}
+
+func (e *SweepIncompleteError) Error() string {
+	fails := append([]*ResourceFailure(nil), e.Failed...)
+	sort.Slice(fails, func(i, j int) bool { return fails[i].Resource < fails[j].Resource })
+	var b strings.Builder
+	fmt.Fprintf(&b, "retention sweep incomplete: %d resource(s) not disposed (retryable):", len(fails))
+	for _, f := range fails {
+		fmt.Fprintf(&b, "\n  - %s", f.Error())
+	}
+	return b.String()
 }
 
 // sweepDelete 从全部健康副本删除记录并写审计（存储层预检，不产生部分写入）。
