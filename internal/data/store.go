@@ -39,6 +39,9 @@ type replica struct {
 // 否则返回 *ReplicaError（可重试），绝不静默成功。
 type Store struct {
 	replicas []*replica
+
+	injMu        sync.RWMutex
+	failResource map[string]struct{} // 故障注入：命中这些资源的写操作按"副本不可用"失败
 }
 
 // NewStore 创建具有 n 个副本的存储（n>=1）。
@@ -57,6 +60,9 @@ func NewStore(n int) *Store {
 // （变更前预检，不产生部分写入），返回 *ReplicaError，可重试。
 func (s *Store) Put(rec Record) error {
 	if err := s.preflight("put"); err != nil {
+		return err
+	}
+	if err := s.preflightResource("put", rec.Resource); err != nil {
 		return err
 	}
 	stored := cloneRecord(rec)
@@ -85,6 +91,9 @@ func (s *Store) Delete(resource string) (bool, error) {
 	if err := s.preflight("delete"); err != nil {
 		return false, err
 	}
+	if err := s.preflightResource("delete", resource); err != nil {
+		return false, err
+	}
 	r0 := s.replicas[0]
 	r0.mu.Lock()
 	_, existed := r0.records[resource]
@@ -103,6 +112,9 @@ func (s *Store) Delete(resource string) (bool, error) {
 // 返回副本 0 中记录是否存在。
 func (s *Store) Anonymize(resource string, fields []string) (bool, error) {
 	if err := s.preflight("anonymize"); err != nil {
+		return false, err
+	}
+	if err := s.preflightResource("anonymize", resource); err != nil {
 		return false, err
 	}
 	for _, r := range s.replicas {
@@ -199,6 +211,23 @@ func (s *Store) SetReplicaHealthy(idx int, healthy bool) {
 	r.mu.Unlock()
 }
 
+// SetResourceFaultForTest 用于故障注入：让针对某资源的写操作（Put/Delete/Anonymize）
+// 以"该资源所在副本暂时不可用"的形式失败（返回 *ReplicaError，不产生部分写入），
+// 模拟同一轮扫描里仅个别资源的存储副本当时不可用、而其他资源可正常处置。
+// 传 healthy=true（或换一个资源）解除注入。
+func (s *Store) SetResourceFaultForTest(resource string, faulty bool) {
+	s.injMu.Lock()
+	defer s.injMu.Unlock()
+	if s.failResource == nil {
+		s.failResource = make(map[string]struct{})
+	}
+	if faulty {
+		s.failResource[resource] = struct{}{}
+	} else {
+		delete(s.failResource, resource)
+	}
+}
+
 // preflight 检查全部副本健康；不健康则返回失败副本列表，不执行任何变更。
 func (s *Store) preflight(op string) error {
 	var bad []int
@@ -211,6 +240,21 @@ func (s *Store) preflight(op string) error {
 	}
 	if len(bad) > 0 {
 		return &ReplicaError{Op: op, Failed: bad}
+	}
+	return nil
+}
+
+// preflightResource 在全副本预检之外，再做按资源的故障注入检查。
+func (s *Store) preflightResource(op, resource string) error {
+	s.injMu.RLock()
+	_, bad := s.failResource[resource]
+	s.injMu.RUnlock()
+	if bad {
+		idx := 1 // 模拟该资源在副本 1 上当时不可用；单副本时退回副本 0
+		if len(s.replicas) <= idx {
+			idx = 0
+		}
+		return &ReplicaError{Op: op, Failed: []int{idx}}
 	}
 	return nil
 }

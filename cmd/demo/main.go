@@ -118,6 +118,51 @@ func main() {
 	again, _ := proc.SweepWithPolicy(now, snap, dsr.SweepDelete, nil)
 	fmt.Printf("二次扫描 affected=%v（已处置资源不重复处置、不重复写审计）\n", again)
 
+	fmt.Println("== 单轮部分失败互不影响，修复后重跑收敛 ==")
+	// 再放两条到期数据：users/3 的副本注入一次存储故障；cache/1 命中内容有误的保留期规则。
+	ds.Put(data.Record{ID: "users/3", SubjectID: "subj-3", Resource: "users/3",
+		Data:        map[string]any{"name": "cara", "email": "cara@example.com"},
+		RetainUntil: &past})
+	ds.Put(data.Record{ID: "cache/1", SubjectID: "subj-3", Resource: "cache/1",
+		Data:        map[string]any{"blob": "..."},
+		RetainUntil: &past})
+	ds.Put(data.Record{ID: "logs/2026-08", SubjectID: "subj-2", Resource: "logs/2026-08",
+		Data:        map[string]any{"line": "old login"},
+		RetainUntil: &past})
+	ds.SetResourceFaultForTest("users/3", true) // users/3 的副本此刻不可用
+	ps.Publish(&policy.Policy{Version: 4, Name: "retention", Rules: []policy.Rule{
+		{ID: "open-read", Effect: policy.EffectAllow,
+			Actions: []policy.Action{policy.ActionRead}, Subjects: []string{"user:*"}, Resources: []string{"users/*"}},
+	}, Retention: []policy.RetentionRule{
+		{ID: "anon-users", Resources: []string{"users/*"}, Action: policy.RetentionAnonymize, Fields: []string{"email", "ssn"}, Priority: 10},
+		{ID: "del-logs", Resources: []string{"logs/*"}, Action: policy.RetentionDelete, Priority: 10},
+		{ID: "bad-cache", Resources: []string{"cache/*"}, Action: policy.RetentionAction("purge"), Priority: 10},
+	}})
+	snap4, _ := ps.Snapshot(0)
+	affected, err = proc.SweepWithPolicy(now, snap4, dsr.SweepDelete, nil)
+	if pe, ok := err.(*dsr.PartialSweepError); ok {
+		failed := make([]string, 0, len(pe.Failures))
+		for _, f := range pe.Failures {
+			failed = append(failed, f.Resource)
+		}
+		fmt.Printf("第1轮: 已处置=%v，未完成=%v（整轮明确报错、可重跑；其他资源未被拖累）\n", pe.Succeeded, failed)
+	} else {
+		fmt.Printf("sweep affected=%v err=%v\n", affected, err)
+	}
+	// 修复：副本恢复 + 发布内容正确的规则 v5。
+	ds.SetResourceFaultForTest("users/3", false)
+	ps.Publish(&policy.Policy{Version: 5, Name: "retention", Rules: []policy.Rule{
+		{ID: "open-read", Effect: policy.EffectAllow,
+			Actions: []policy.Action{policy.ActionRead}, Subjects: []string{"user:*"}, Resources: []string{"users/*"}},
+	}, Retention: []policy.RetentionRule{
+		{ID: "anon-users", Resources: []string{"users/*"}, Action: policy.RetentionAnonymize, Fields: []string{"email", "ssn"}, Priority: 10},
+		{ID: "del-logs", Resources: []string{"logs/*"}, Action: policy.RetentionDelete, Priority: 10},
+		{ID: "del-cache", Resources: []string{"cache/*"}, Action: policy.RetentionDelete, Priority: 10},
+	}})
+	snap5, _ := ps.Snapshot(0)
+	affected, err = proc.SweepWithPolicy(now, snap5, dsr.SweepDelete, nil)
+	fmt.Printf("修复后重跑: 补齐=%v err=%v；已完成的资源不会重复处置、重复留痕\n", affected, err)
+
 	fmt.Println("== 审计完整性 ==")
 	fmt.Printf("entries=%d\n", lg.Len())
 	if seq, err := lg.Verify(); seq == -1 {

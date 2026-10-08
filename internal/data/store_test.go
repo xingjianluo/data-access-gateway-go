@@ -101,3 +101,54 @@ func TestExpiredAndAnonymize(t *testing.T) {
 	}
 	t.Log("RETENTION BOUNDARY: only past-due records selected; anonymization hit all replicas")
 }
+
+// TestResourceFaultIsolation 验证按资源的故障注入只影响目标资源：
+// 对 users/bad 的写操作失败且无部分写入，其他资源的写操作不受影响；解除后恢复。
+func TestResourceFaultIsolation(t *testing.T) {
+	s := NewStore(3)
+	if err := s.Put(sampleRec("users/ok", "subj-ok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(sampleRec("users/bad", "subj-bad")); err != nil {
+		t.Fatal(err)
+	}
+
+	s.SetResourceFaultForTest("users/bad", true)
+
+	// 故障资源：Delete/Anonymize/Put 均以可重试的副本错误失败，且不产生部分写入。
+	if _, err := s.Delete("users/bad"); err == nil {
+		t.Fatal("faulty resource delete must fail")
+	} else if re, ok := err.(*ReplicaError); !ok {
+		t.Fatalf("faulty resource delete must return *ReplicaError, got %v", err)
+	} else if len(re.Failed) != 1 {
+		t.Fatalf("应点名单个故障副本: %v", re.Failed)
+	}
+	if _, err := s.Anonymize("users/bad", []string{"email"}); err == nil {
+		t.Fatal("faulty resource anonymize must fail")
+	}
+	for i := 0; i < 3; i++ {
+		got := s.ExportReplica(i, "subj-bad")
+		if len(got) != 1 || got[0].Data["email"] != "a@x.com" {
+			t.Fatalf("故障资源不得产生部分写入，副本 %d 实际 %+v", i, got)
+		}
+	}
+
+	// 其他资源完全不受影响。
+	if _, err := s.Anonymize("users/ok", []string{"email"}); err != nil {
+		t.Fatalf("健康资源不应被故障资源拖累: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		got := s.ExportReplica(i, "subj-ok")
+		if len(got) != 1 || got[0].Data["email"] != "<anonymized>" {
+			t.Fatalf("健康资源副本 %d 应正常匿名化: %+v", i, got)
+		}
+	}
+	t.Log("RESOURCE FAULT: users/bad writes fail retryable with no partial write; users/ok unaffected")
+
+	// 解除注入后恢复正常。
+	s.SetResourceFaultForTest("users/bad", false)
+	existed, err := s.Delete("users/bad")
+	if err != nil || !existed {
+		t.Fatalf("解除故障后删除应成功: existed=%v err=%v", existed, err)
+	}
+}
